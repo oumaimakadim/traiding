@@ -1,239 +1,283 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.svm import SVC
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
-from sklearn.preprocessing import LabelEncoder
-import pytorch_lightning as pl
+from sklearn.svm import SVC, SVR
+from sklearn.linear_model import LogisticRegression, LinearRegression, Perceptron
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn.preprocessing import StandardScaler
+from sklearn.manifold import TSNE
+from sklearn.metrics import classification_report, mean_squared_error
+from ta import add_all_ta_features
+from ta.utils import dropna
+import pywt
 import torch
+import pytorch_lightning as pl
 from torch.utils.data import DataLoader, TensorDataset
-from torch import nn
-import yfinance as yf
+import torch.nn.functional as F
+from transformers import BertTokenizer, BertForSequenceClassification
 
-
-# Fonction pour télécharger les données financières avec yfinance
-def load_data(tickers, start, end):
-    data = yf.download(tickers, start=start, end=end)['Adj Close']
+# Fonction pour télécharger les données
+def download_data(ticker, start, end):
+    data = yf.download(ticker, start=start, end=end)
     return data
 
-
-# Fonction pour préparer les données
-def prepare_data(data):
-    data = data.dropna()
-    if data.empty:
-        raise ValueError("Les données téléchargées sont vides. Vérifiez les tickers et la période sélectionnée.")
-    data['return'] = data.pct_change().mean(axis=1)
-    data['volatility'] = data.pct_change().std(axis=1)
-    data['volume'] = data.mean(axis=1)  # Volume moyen simulé pour cet exemple
-    data['trend'] = (data['return'] > 0).astype(int)
-    data['target'] = (data['return'] > data['return'].mean()).astype(int)  # Créer une cible binaire pour rendement
-
-    # Convertir les valeurs continues en classes discrètes
-    data['volatility_class'] = pd.qcut(data['volatility'], q=3, labels=['Low', 'Medium', 'High'])
-    data['volume_class'] = pd.qcut(data['volume'], q=3, labels=['Low', 'Medium', 'High'])
-
+# Fonction pour calculer les indicateurs techniques
+def calculate_technical_indicators(data):
+    data = dropna(data)
+    data = add_all_ta_features(
+        data, open="Open", high="High", low="Low", close="Close", volume="Volume", fillna=True
+    )
     return data
 
+# Fonction pour préparer les données pour la classification
+def prepare_data_classification(data):
+    features = data.drop(columns=["Open", "High", "Low", "Close", "Volume", "Adj Close"])
+    target = np.where(data["Close"].shift(-1) > data["Close"], 1, 0)
+    features, target = features.iloc[:-1, :], target[:-1]  # Align features with target
+    return features, target
 
-# Définir le modèle de prédiction avec PyTorch Lightning
-class PerformancePredictor(pl.LightningModule):
-    def __init__(self, input_dim):
-        super(PerformancePredictor, self).__init__()
-        self.layer_1 = nn.Linear(input_dim, 128)
-        self.layer_2 = nn.Linear(128, 64)
-        self.output = nn.Linear(64, 2)
+# Fonction pour préparer les données pour la régression
+def prepare_data_regression(data):
+    features = data.drop(columns=["Open", "High", "Low", "Close", "Volume", "Adj Close"])
+    target = data["Close"].shift(-1).dropna()
+    features = features.iloc[:-1, :]  # Align features with target
+    return features, target
 
-    def forward(self, x):
-        x = torch.relu(self.layer_1(x))
-        x = torch.relu(self.layer_2(x))
-        return self.output(x)
+# Fonction pour appliquer PCA
+def apply_pca(features):
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(features)
+    pca = PCA(n_components=2)
+    pca_components = pca.fit_transform(scaled_features)
+    return pca_components
+
+# Fonction pour appliquer t-SNE
+def apply_tsne(features):
+    scaler = StandardScaler()
+    scaled_features = scaler.fit_transform(features)
+    tsne = TSNE(n_components=2, perplexity=30, n_iter=300)
+    tsne_components = tsne.fit_transform(scaled_features)
+    return tsne_components
+
+# Fonction pour appliquer la transformée en ondelettes
+def apply_wavelet_transform(data):
+    wavelet = 'db1'
+    coeffs = pywt.wavedec(data['Close'], wavelet, level=3)
+    coeffs_flattened = np.concatenate(coeffs)
+    return coeffs_flattened
+
+# Fonction pour prédire les prix futurs
+def predict_future_prices(features, target, model):
+    model.fit(features, target)
+    future_predictions = model.predict(features[-5:])
+    return future_predictions
+
+# Fonction pour détecter les opportunités de trading
+def detect_trading_opportunities(data, model, features, target):
+    model.fit(features, target)
+    buy_signals = data[(data['Close'] > data['Open']) & (data['Close'] > data['Close'].shift(1))]
+    sell_signals = data[(data['Close'] < data['Open']) & (data['Close'] < data['Close'].shift(1))]
+    return buy_signals, sell_signals
+
+# Lightning module for classification with LLM
+class LightningLLMClassifier(pl.LightningModule):
+    def __init__(self, model_name, num_labels):
+        super(LightningLLMClassifier, self).__init__()
+        self.model = BertForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
+        self.tokenizer = BertTokenizer.from_pretrained(model_name)
+
+    def forward(self, input_ids, attention_mask, labels=None):
+        output = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        return output
 
     def training_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self.forward(x)
-        loss = nn.CrossEntropyLoss()(y_hat, y)
+        inputs = self.tokenizer(batch['text'], padding=True, truncation=True, return_tensors="pt")
+        labels = batch['label']
+        outputs = self.forward(input_ids=inputs['input_ids'], attention_mask=inputs['attention_mask'], labels=labels)
+        loss = outputs.loss
         return loss
-
+    
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(self.parameters(), lr=0.0001)
+        return optimizer
 
+# Fonction principale
+def main():
+    st.set_page_config(page_title="Plateforme de Trading", layout="wide")
+    
+    st.title("Plateforme de Détection des Opportunités de Trading et Prédiction des Prix")
 
-# Télécharger les données
-st.title('Analyse et Prédiction des Performances des Actions Internationales')
-tickers = st.text_input('Entrer les symboles des actions (séparés par des espaces)', 'AAPL GOOGL MSFT AMZN')
-tickers = tickers.split()
-start_date = st.date_input('Date de début', value=pd.to_datetime('2020-01-01'))
-end_date = st.date_input('Date de fin', value=pd.to_datetime('2022-01-01'))
+    # Documentation
+    st.markdown("""
+    ## Introduction
+    Bienvenue sur la plateforme de détection des opportunités de trading et de prédiction des prix ! Cet outil est conçu pour vous aider à analyser les données du marché boursier, à détecter des opportunités de trading potentielles et à prédire les prix futurs des actions à l'aide de modèles avancés de machine learning. Décomposons chaque composant pour vous aider à prendre des décisions d'investissement éclairées.
 
-if st.button('Charger les données'):
-    try:
-        data = load_data(tickers, start=start_date, end=end_date)
-        if data.empty:
-            st.error("Les données téléchargées sont vides. Vérifiez les tickers et la période sélectionnée.")
+    ## Analyse des Données et Indicateurs Techniques
+    La plateforme télécharge les données historiques des actions pour le symbole de ticker de votre choix à partir de Yahoo Finance. Les données incluent des métriques telles que les prix d'ouverture, de clôture, les plus hauts et les plus bas, le volume, et les prix ajustés de clôture.
+
+    **Indicateurs Techniques :**
+    - **Moyennes Mobiles (MA) :** Moyenne les prix de clôture sur une période spécifiée pour lisser les données de prix et identifier les tendances.
+    - **Indice de Force Relative (RSI) :** Mesure la vitesse et le changement des mouvements de prix pour identifier les conditions de surachat ou de survente.
+    - **Convergence-Divergence des Moyennes Mobiles (MACD) :** Montre la relation entre deux moyennes mobiles pour indiquer des signaux d'achat ou de vente.
+    - **Bandes de Bollinger :** Composées d'une bande centrale (moyenne mobile simple) et de bandes supérieure et inférieure (écarts types) pour indiquer la volatilité.
+
+    ## Réduction de Dimensionnalité
+    Pour simplifier les données et visualiser leurs principales caractéristiques, nous utilisons :
+    - **Analyse en Composantes Principales (PCA) :** Réduit les données à deux composantes principales, capturant la plus grande variance dans les données.
+    - **t-Distributed Stochastic Neighbor Embedding (t-SNE) :** Réduit les données à deux dimensions, préservant la structure locale et les relations entre les points.
+
+    ## Modèles de Classification
+    Les modèles de classification prédisent si le prix de l'action va augmenter ou diminuer en fonction des données historiques. Choisissez parmi plusieurs modèles :
+    - **Analyse Discriminante Linéaire (LDA) :** Projette les données dans un espace de dimension inférieure tout en maximisant la séparabilité des classes.
+    - **Machines à Vecteurs de Support (SVM) :** Trouve l'hyperplan optimal qui sépare différentes classes dans les données.
+    - **Régression Logistique :** Modélise la probabilité d'un résultat binaire en fonction d'une ou plusieurs variables prédictives.
+    - **K-Nearest Neighbors (KNN) :** Classe un point de données en fonction de la majorité de la classe parmi ses voisins les plus proches.
+    - **Arbre de Décision :** Divise les données en branches pour prédire la variable cible.
+    - **Perceptron :** Un modèle de réseau neuronal simple qui peut classer les points de données en classes binaires.
+    - **Lightning LLM :** Utilise un grand modèle de langage (par exemple, BERT) pour des prédictions plus avancées et contextuelles.
+
+    ## Signaux de Trading
+    Après avoir ajusté le modèle de classification, la plateforme détecte les opportunités de trading potentielles :
+    - **Signaux d'Achat :** Indiquent quand acheter l'action, basés sur des critères spécifiques (par exemple, le prix de clôture est supérieur au prix d'ouverture).
+    - **Signaux de Vente :** Indiquent quand vendre l'action, basés sur des critères spécifiques (par exemple, le prix de clôture est inférieur au prix d'ouverture).
+
+    ## Prédiction des Prix
+    Pour prédire les prix futurs des actions, la plateforme utilise des modèles de régression. Vous pouvez choisir parmi :
+    - **Régression à Vecteurs de Support (SVR) :** Étend SVM pour prédire des valeurs continues.
+    - **Régression Linéaire :** Modélise la relation entre la cible et les variables prédictives comme une fonction linéaire.
+    - **Régression par Arbre de Décision :** Divise les données en branches pour prédire des valeurs continues.
+
+    La plateforme applique également la Transformée en Ondelettes pour extraire des caractéristiques supplémentaires des données de séries temporelles.
+
+    ## Visualisation
+    La plateforme visualise les prix historiques des actions, les indicateurs techniques et les prix futurs prédits, vous aidant à comprendre les tendances et à prendre des décisions d'investissement éclairées.
+
+    En utilisant ces outils analytiques avancés, vous pouvez obtenir des informations sur les tendances du marché boursier, identifier des opportunités de trading potentielles et prendre des décisions d'investissement plus éclairées.
+    """)
+
+    # Sidebar pour les paramètres
+    st.sidebar.header("Paramètres de l'analyse")
+    asset_type = st.sidebar.selectbox("Choisissez le type d'actif", ["Action", "Cryptomonnaie"])
+    if asset_type == "Action":
+        ticker = st.sidebar.selectbox("Choisissez le symbole de l'action", ["AAPL", "AMZN", "GOOGL", "MSFT", "TSLA", "FB", "NVDA", "NFLX", "BRK-A", "V"])
+    else:
+        ticker = st.sidebar.selectbox("Choisissez le symbole de la cryptomonnaie", ["BTC-USD", "ETH-USD", "XRP-USD", "LTC-USD", "BCH-USD", "ADA-USD", "DOT1-USD", "LINK-USD", "XLM-USD", "DOGE-USD"])
+
+    start_date = st.sidebar.date_input("Date de début", value=pd.to_datetime("2022-01-01"))
+    end_date = st.sidebar.date_input("Date de fin", value=pd.to_datetime("2023-01-01"))
+    model_choice = st.sidebar.selectbox("Choisissez le modèle de machine learning pour la classification", ["LDA", "SVM", "Logistic Regression", "KNN", "Decision Tree", "Perceptron", "Lightning LLM"])
+    regression_model_choice = st.sidebar.selectbox("Choisissez le modèle de régression", ["SVR", "Linear Regression", "Decision Tree Regressor"])
+    
+    if st.sidebar.button("Télécharger les données"):
+        data = download_data(ticker, start=start_date, end=end_date)
+        
+        # Afficher les données brutes
+        st.subheader("Données Brutes")
+        st.dataframe(data.head())
+
+        # Calculer et afficher les indicateurs techniques
+        data_ta = calculate_technical_indicators(data)
+        st.subheader("Données avec Indicateurs Techniques")
+        st.dataframe(data_ta.head())
+
+        # Préparer les données pour la classification
+        features, target = prepare_data_classification(data_ta)
+
+        # Afficher le graphique des prix de clôture
+        st.subheader("Graphique des Prix de Clôture")
+        st.line_chart(data['Close'])
+
+        # Appliquer PCA et t-SNE et afficher les composantes principales
+        pca_components = apply_pca(features)
+        tsne_components = apply_tsne(features)
+        st.subheader("Composantes Principales (PCA)")
+        st.write(pca_components[:5])
+        st.subheader("Composantes t-SNE")
+        st.write(tsne_components[:5])
+
+        # Choisir le modèle de machine learning pour la classification
+        models = {
+            "LDA": LDA(),
+            "SVM": SVC(),
+            "Logistic Regression": LogisticRegression(),
+            "KNN": KNeighborsClassifier(),
+            "Decision Tree": DecisionTreeClassifier(),
+            "Perceptron": Perceptron()
+        }
+        
+        if model_choice != "Lightning LLM":
+            model = models[model_choice]
+            model.fit(pca_components, target)
+            buy_signals, sell_signals = detect_trading_opportunities(data_ta, model, pca_components, target)
+            st.write(classification_report(target, model.predict(pca_components)))
         else:
-            data = prepare_data(data)
-            st.write(data)
-
-            # Encoder les classes catégorielles
-            le_volatility = LabelEncoder()
-            data['volatility_class_encoded'] = le_volatility.fit_transform(data['volatility_class'])
-
-            le_volume = LabelEncoder()
-            data['volume_class_encoded'] = le_volume.fit_transform(data['volume_class'])
-
-            # Réduction de Dimensionnalité avec PCA
-            X = data.drop(
-                columns=['target', 'trend', 'volatility', 'volume', 'return', 'volatility_class', 'volume_class'])
-            y = data['target']
-            pca = PCA(n_components=2)
-            X_pca = pca.fit_transform(X)
-            tsne = TSNE(n_components=2)
-            X_tsne = tsne.fit_transform(X)
-
-            # Calculer dynamiquement le nombre de composantes pour LDA
-            n_classes = len(np.unique(y))
-            n_features = X.shape[1]
-            n_components_lda = min(n_features, n_classes - 1)
-            lda = LDA(n_components=n_components_lda)
-            X_lda = lda.fit_transform(X, y)
-
-            # Diviser les données en ensembles d'entraînement et de test
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-
-            # Classification de la Volatilité avec Decision Tree
-            tree = DecisionTreeClassifier()
-            tree.fit(X_train, data['volatility_class_encoded'].loc[X_train.index])
-            y_pred_tree = tree.predict(X_test)
-
-            # Classification du Rendement avec SVM
-            svm = SVC()
-            svm.fit(X_train, y_train)
-            y_pred_svm = svm.predict(X_test)
-
-            # Classification du Volume avec KNN
-            knn = KNeighborsClassifier()
-            knn.fit(X_train, data['volume_class_encoded'].loc[X_train.index])
-            y_pred_knn = knn.predict(X_test)
-
-            # Classification de la Tendance avec Logistic Regression
-            log_reg = LogisticRegression(max_iter=1000)
-            log_reg.fit(X_train, data['trend'].loc[X_train.index])
-            y_pred_log_reg = log_reg.predict(X_test)
-
-            # Prédiction des Performances Futures avec PyTorch Lightning
-            X_tensor = torch.tensor(X.values, dtype=torch.float32)
-            y_tensor = torch.tensor(y.values, dtype=torch.long)
-            dataset = TensorDataset(X_tensor, y_tensor)
+            # Prepare DataLoader for Lightning
+            # Create dummy text data and labels for illustration
+            texts = ["example text 1"] * len(features)  # Replace with actual text data
+            labels = target.tolist()
+            dataset = [{'text': text, 'label': label} for text, label in zip(texts, labels)]
             train_loader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-            model = PerformancePredictor(input_dim=X.shape[1])
-            trainer = pl.Trainer(max_epochs=20)
+            
+            # Initialize and train Lightning model
+            model = LightningLLMClassifier(model_name='bert-base-uncased', num_labels=2)
+            trainer = pl.Trainer(max_epochs=10, gpus=1 if torch.cuda.is_available() else 0)
             trainer.fit(model, train_loader)
+            
+            st.write("Lightning LLM model trained successfully.")
+        
+        st.subheader("Opportunités de Trading")
+        st.write("Signaux d'achat")
+        st.dataframe(buy_signals[['Close']])
+        st.write("Signaux de vente")
+        st.dataframe(sell_signals[['Close']])
+        
+        # Afficher les signaux d'achat et de vente sur le graphique
+        st.subheader("Graphique des Signaux de Trading")
+        fig, ax = plt.subplots()
+        ax.plot(data.index, data['Close'], label='Prix de Clôture', color='blue')
+        ax.scatter(buy_signals.index, buy_signals['Close'], label='Acheter', marker='^', color='green')
+        ax.scatter(sell_signals.index, sell_signals['Close'], label='Vendre', marker='v', color='red')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Prix')
+        ax.legend()
+        st.pyplot(fig)
 
-            # Affichage des données sous forme de graphiques
-            st.header("Visualisations")
-            st.subheader('Réduction de Dimensionnalité avec PCA')
-            fig, ax = plt.subplots()
-            scatter = ax.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='viridis')
-            legend1 = ax.legend(*scatter.legend_elements(), title="Classes")
-            ax.add_artist(legend1)
-            st.pyplot(fig)
+        # Préparer les données pour la régression
+        reg_features, reg_target = prepare_data_regression(data_ta)
 
-            st.subheader('Exploration des Données avec t-SNE')
-            fig, ax = plt.subplots()
-            scatter = ax.scatter(X_tsne[:, 0], X_tsne[:, 1], c=y, cmap='viridis')
-            legend1 = ax.legend(*scatter.legend_elements(), title="Classes")
-            ax.add_artist(legend1)
-            st.pyplot(fig)
+        # Appliquer la transformée en ondelettes
+        wavelet_features = apply_wavelet_transform(data_ta)
+        wavelet_features = wavelet_features.reshape(-1, 1)  # reshape pour s'adapter à l'entrée du modèle
 
-            st.subheader('Séparation des Classes avec LDA')
-            fig, ax = plt.subplots()
-            if n_components_lda > 1:
-                scatter = ax.scatter(X_lda[:, 0], X_lda[:, 1], c=y, cmap='viridis')
-            else:
-                scatter = ax.scatter(X_lda[:, 0], np.zeros_like(X_lda[:, 0]), c=y, cmap='viridis')
-            legend1 = ax.legend(*scatter.legend_elements(), title="Classes")
-            ax.add_artist(legend1)
-            st.pyplot(fig)
+        # Choisir le modèle de régression
+        regression_models = {
+            "SVR": SVR(),
+            "Linear Regression": LinearRegression(),
+            "Decision Tree Regressor": DecisionTreeRegressor()
+        }
+        regression_model = regression_models[regression_model_choice]
 
-            # Explications des modèles
-            # Classification de la Volatilité avec Decision Tree
-            st.subheader("Classification de la Volatilité avec Decision Tree")
-            st.write("Le modèle Decision Tree est utilisé pour classer les niveaux de volatilité des actions.")
-            st.text(classification_report(data['volatility_class_encoded'].loc[X_test.index], y_pred_tree))
+        # Prédire les prix futurs
+        future_prices = predict_future_prices(wavelet_features[:len(reg_target)], reg_target, regression_model)
+        
+        st.subheader("Prédiction des Prix Futurs")
+        st.write("Prix prédits pour les 5 prochains jours:", future_prices)
+        
+        # Afficher les prédictions des prix futurs sur le graphique
+        st.subheader("Graphique des Prix avec Prédictions")
+        fig, ax = plt.subplots()
+        ax.plot(data.index, data['Close'], label='Prix de Clôture', color='blue')
+        future_index = pd.date_range(start=data.index[-1], periods=6)
+        ax.plot(future_index, np.concatenate([[data['Close'].iloc[-1]], future_prices]), label='Prédictions', color='red')
+        ax.set_xlabel('Date')
+        ax.set_ylabel('Prix')
+        ax.legend()
+        st.pyplot(fig)
 
-            # Classification du Rendement avec SVM
-            st.subheader("Classification du Rendement avec SVM")
-            st.write(
-                "Le modèle SVM (Support Vector Machine) est utilisé pour prédire la performance future des actions.")
-            st.text(classification_report(y_test, y_pred_svm))
-
-            # Classification du Volume avec KNN
-            st.subheader("Classification du Volume avec KNN")
-            st.write("Le modèle KNN (K-Nearest Neighbors) est utilisé pour classer les volumes des actions.")
-            st.text(classification_report(data['volume_class_encoded'].loc[X_test.index], y_pred_knn))
-
-            # Classification de la Tendance avec Logistic Regression
-            st.subheader("Classification de la Tendance avec Logistic Regression")
-            st.write("Le modèle Logistic Regression est utilisé pour prédire la tendance future des actions.")
-            st.text(classification_report(data['trend'].loc[X_test.index], y_pred_log_reg))
-
-            # Prédiction des Performances Futures avec PyTorch Lightning
-            st.subheader("Prédiction des Performances Futures avec PyTorch Lightning")
-            st.write("Le modèle PyTorch Lightning est utilisé pour prédire les performances futures des actions.")
-
-            # Prédictions avec le modèle PyTorch Lightning
-            predictions = model.forward(X_tensor).argmax(dim=1)
-
-            # Ajouter les prédictions au DataFrame
-            data['predictions'] = predictions.numpy()
-
-            # Afficher les prédictions
-            st.write("Prédictions :")
-            st.write(data[['return', 'predictions']].head(10))
-
-            # Recommandations personnalisées
-            st.subheader("Recommandations personnalisées pour l'optimisation du portefeuille...")
-
-            # Exemple de recommandations basées sur les classifications et prédictions
-            recommandations = []
-
-            # Classification de la Volatilité avec Decision Tree
-            if any(y_pred_tree):
-                recommandations.append("La classification de la volatilité avec Decision Tree indique des variations importantes. \
-                Il pourrait être prudent de surveiller de près ces actions et de prendre des décisions en conséquence.")
-
-            # Classification du Rendement avec SVM
-            if any(y_pred_svm):
-                recommandations.append("La classification du rendement avec SVM montre des perspectives positives pour certaines actions. \
-                Il peut être intéressant d'investir davantage dans ces actions pour obtenir des rendements plus élevés.")
-
-            # Classification du Volume avec KNN
-            if any(y_pred_knn):
-                recommandations.append("La classification du volume avec KNN indique une forte activité sur certaines actions. \
-                Il pourrait être avantageux d'examiner de plus près ces actions pour profiter des mouvements du marché.")
-
-            # Classification de la Tendance avec Logistic Regression
-            if any(y_pred_log_reg):
-                recommandations.append("La classification de la tendance avec Logistic Regression suggère des tendances claires sur certains marchés. \
-                Il peut être judicieux d'aligner les stratégies d'investissement en fonction de ces tendances.")
-
-            # Prédiction des Performances Futures avec PyTorch Lightning
-            if any(predictions):
-                recommandations.append("Les prédictions futures avec PyTorch Lightning indiquent des performances potentielles pour les actions. \
-                Il serait judicieux de prendre en compte ces prédictions lors de la planification d'investissements à long terme.")
-
-            # Affichage des recommandations
-            for recommandation in recommandations:
-                st.write(recommandation)
-
-    except Exception as e:
-        st.error(f"Une erreur est survenue : {e}")
+if __name__ == "__main__":
+    main()
